@@ -218,7 +218,6 @@ CREATE INDEX idx_outfit_garments_garment ON public.outfit_garments(garment_id);
 -- Calendar: range queries are the primary access pattern
 CREATE INDEX idx_calendar_user_date     ON public.calendar_entries(user_id, date DESC);
 CREATE INDEX idx_calendar_user_outfit   ON public.calendar_entries(user_id, outfit_id) WHERE outfit_id IS NOT NULL;
-CREATE INDEX idx_calendar_user_month    ON public.calendar_entries(user_id, date_trunc('month', date));
 
 -- ============================================================
 -- FUNCTIONS: auto-update updated_at
