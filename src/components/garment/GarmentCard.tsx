@@ -1,23 +1,24 @@
-import { Pressable, View, Text, StyleSheet, Dimensions } from 'react-native';
+import { Pressable, View, Text, StyleSheet, type ViewStyle } from 'react-native';
 import { Image } from 'expo-image';
 import { Ionicons } from '@expo/vector-icons';
-import { useWardrobeStore } from '@store/wardrobe.store';
 import { GARMENT_TYPE_LABELS, COLORS, SPACING, RADIUS } from '@constants/theme';
 import type { Garment } from '@types/database';
-
-const { width } = Dimensions.get('window');
-const CARD_WIDTH = (width - SPACING.sm * 3) / 2;
 
 interface Props {
   garment: Garment;
   onPress: () => void;
+  onFavoritePress?: () => void;
+  /** Explicit width; if omitted the card fills its container */
+  width?: number;
+  style?: ViewStyle;
 }
 
-export function GarmentCard({ garment, onPress }: Props) {
-  const { toggleFavorite } = useWardrobeStore();
-
+export function GarmentCard({ garment, onPress, onFavoritePress, width, style }: Props) {
   return (
-    <Pressable style={styles.card} onPress={onPress}>
+    <Pressable
+      style={[styles.card, width !== undefined && { width }, style]}
+      onPress={onPress}
+    >
       <View style={styles.imageContainer}>
         <Image
           source={{ uri: garment.thumbnail_url ?? garment.processed_url ?? garment.original_url }}
@@ -26,21 +27,33 @@ export function GarmentCard({ garment, onPress }: Props) {
           transition={150}
           recyclingKey={garment.id}
         />
-        <Pressable
-          style={styles.favoriteBtn}
-          onPress={(e) => {
-            e.stopPropagation();
-            toggleFavorite(garment.id);
-          }}
-          hitSlop={8}
-        >
-          <Ionicons
-            name={garment.is_favorite ? 'heart' : 'heart-outline'}
-            size={18}
-            color={garment.is_favorite ? '#E74C3C' : '#fff'}
-          />
-        </Pressable>
+
+        {/* Favorite badge */}
+        {onFavoritePress && (
+          <Pressable
+            style={styles.favoriteBtn}
+            onPress={(e) => {
+              e.stopPropagation();
+              onFavoritePress();
+            }}
+            hitSlop={8}
+          >
+            <Ionicons
+              name={garment.is_favorite ? 'heart' : 'heart-outline'}
+              size={15}
+              color={garment.is_favorite ? '#E74C3C' : '#fff'}
+            />
+          </Pressable>
+        )}
+
+        {/* Times-worn badge (shown when > 0) */}
+        {garment.times_worn > 0 && (
+          <View style={styles.wornBadge}>
+            <Text style={styles.wornText}>{garment.times_worn}×</Text>
+          </View>
+        )}
       </View>
+
       <View style={styles.meta}>
         <Text style={styles.name} numberOfLines={1}>
           {garment.name ?? GARMENT_TYPE_LABELS[garment.type]}
@@ -56,8 +69,6 @@ export function GarmentCard({ garment, onPress }: Props) {
 
 const styles = StyleSheet.create({
   card: {
-    width: CARD_WIDTH,
-    margin: SPACING.xs,
     borderRadius: RADIUS.md,
     backgroundColor: COLORS.surface,
     overflow: 'hidden',
@@ -66,18 +77,28 @@ const styles = StyleSheet.create({
   image: { width: '100%', height: '100%', backgroundColor: COLORS.surfaceAlt },
   favoriteBtn: {
     position: 'absolute',
-    top: 8,
-    right: 8,
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: 'rgba(0,0,0,0.4)',
+    top: 6,
+    right: 6,
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: 'rgba(0,0,0,0.45)',
     justifyContent: 'center',
     alignItems: 'center',
   },
-  meta: { padding: SPACING.sm },
-  name: { fontSize: 13, fontWeight: '600', color: COLORS.text, marginBottom: 4 },
-  row: { flexDirection: 'row', alignItems: 'center', gap: 6 },
-  colorDot: { width: 12, height: 12, borderRadius: 6 },
-  colorLabel: { fontSize: 11, color: COLORS.textMuted, flex: 1 },
+  wornBadge: {
+    position: 'absolute',
+    bottom: 6,
+    left: 6,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    borderRadius: RADIUS.full,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  wornText: { fontSize: 10, color: '#fff', fontWeight: '600' },
+  meta: { padding: SPACING.xs + 2 },
+  name: { fontSize: 11, fontWeight: '600', color: COLORS.text, marginBottom: 3 },
+  row: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  colorDot: { width: 10, height: 10, borderRadius: 5, flexShrink: 0 },
+  colorLabel: { fontSize: 10, color: COLORS.textMuted, flex: 1 },
 });

@@ -1,307 +1,769 @@
-import { useState, useCallback } from 'react';
 import {
-  View, Text, StyleSheet, Pressable, ScrollView,
-  TextInput, ActivityIndicator, Alert,
+  useState, useCallback, useRef, useEffect,
+} from 'react';
+import {
+  View, Text, StyleSheet, Pressable, ScrollView, TextInput,
+  Animated, Dimensions, Switch, Alert, Platform,
+  KeyboardAvoidingView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
-import * as ImageManipulator from 'expo-image-manipulator';
-import * as FileSystem from 'expo-file-system';
 import { router } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
+import * as Haptics from 'expo-haptics';
 import Toast from 'react-native-toast-message';
 import { useAuthStore } from '@store/auth.store';
-import { useWardrobeStore } from '@store/wardrobe.store';
-import { supabase } from '@lib/supabase/client';
-import { uploadGarmentImage } from '@lib/supabase/storage';
-import { GARMENT_TYPE_LABELS, COLORS, SPACING } from '@constants/theme';
-import type { GarmentType, Garment } from '@types/database';
+import { useAddGarment } from '@hooks/useGarments';
+import {
+  uploadToRemoveBg,
+  classifyWithVision,
+} from '@services/garmentService';
+import {
+  GARMENT_TYPE_LABELS,
+  OCCASION_LABELS,
+  PATTERN_LABELS,
+  COLORS,
+  SPACING,
+  RADIUS,
+} from '@constants/theme';
+import type { GarmentType, GarmentSeason } from '@types/database';
+import {
+  ClassificationResult,
+  GarmentFormData,
+  DEFAULT_FORM_DATA,
+  UploadStage,
+  UPLOAD_STAGE_MESSAGES,
+  UPLOAD_STAGE_PERCENT,
+  GarmentServiceError,
+} from '@types/garment';
 
-type UploadStep = 'idle' | 'removing-bg' | 'classifying' | 'saving';
+const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
-const STEP_LABELS: Record<UploadStep, string> = {
-  idle: '',
-  'removing-bg': 'Recortando fondo...',
-  classifying: 'Clasificando prenda...',
-  saving: 'Guardando...',
+// ─── Pipeline steps UI ────────────────────────────────────────────────────────
+
+const PIPELINE_STEPS: Array<{ stage: UploadStage; label: string }> = [
+  { stage: 'compressing', label: 'Foto' },
+  { stage: 'removing-bg', label: 'Recorte' },
+  { stage: 'classifying', label: 'Clasificar' },
+  { stage: 'done', label: 'Listo' },
+];
+
+const STAGE_ORDER: UploadStage[] = [
+  'idle', 'compressing', 'removing-bg', 'classifying', 'uploading', 'saving', 'done',
+];
+
+function stageIndex(s: UploadStage): number {
+  return STAGE_ORDER.indexOf(s);
+}
+
+// ─── Multi-select chip sets ───────────────────────────────────────────────────
+
+const OCCASION_OPTIONS = Object.keys(OCCASION_LABELS) as string[];
+const SEASON_OPTIONS: GarmentSeason[] = ['spring', 'summer', 'fall', 'winter', 'all'];
+const SEASON_LABELS: Record<GarmentSeason, string> = {
+  spring: 'Primavera', summer: 'Verano', fall: 'Otoño', winter: 'Invierno', all: 'Todo el año',
 };
+const PATTERN_OPTIONS = Object.keys(PATTERN_LABELS) as string[];
 
-export default function AddGarmentModal() {
+// ─── Component ────────────────────────────────────────────────────────────────
+
+export default function AddGarmentScreen() {
   const { user } = useAuthStore();
-  const { addGarment } = useWardrobeStore();
+  const { mutateAsync: addGarment, isPending: isSaving } = useAddGarment();
 
+  // ── Image state ─────────────────────────────────────────────────────────────
   const [originalUri, setOriginalUri] = useState<string | null>(null);
   const [processedUri, setProcessedUri] = useState<string | null>(null);
-  const [step, setStep] = useState<UploadStep>('idle');
+  const [showingProcessed, setShowingProcessed] = useState(true);
 
-  // Editable classification fields
-  const [type, setType] = useState<GarmentType>('top');
-  const [colorLabel, setColorLabel] = useState('');
-  const [primaryColor, setPrimaryColor] = useState('#888888');
-  const [brand, setBrand] = useState('');
-  const [name, setName] = useState('');
-  const [aiDone, setAiDone] = useState(false);
-  const [aiData, setAiData] = useState<Record<string, unknown> | null>(null);
+  // ── Pipeline state ──────────────────────────────────────────────────────────
+  const [stage, setStage] = useState<UploadStage>('idle');
+  const [pipelineError, setPipelineError] = useState<string | null>(null);
+  const [classification, setClassification] = useState<ClassificationResult | null>(null);
 
+  // ── Form state ──────────────────────────────────────────────────────────────
+  const [form, setForm] = useState<GarmentFormData>(DEFAULT_FORM_DATA);
+  const [tagInput, setTagInput] = useState('');
+
+  // ── Progress bar animation ──────────────────────────────────────────────────
+  const progressAnim = useRef(new Animated.Value(0)).current;
+
+  const animateToPercent = useCallback((percent: number) => {
+    Animated.timing(progressAnim, {
+      toValue: percent,
+      duration: 400,
+      useNativeDriver: false,
+    }).start();
+  }, [progressAnim]);
+
+  useEffect(() => {
+    animateToPercent(UPLOAD_STAGE_PERCENT[stage]);
+  }, [stage, animateToPercent]);
+
+  // ── Image picker ─────────────────────────────────────────────────────────────
   const pickImage = useCallback(async (fromCamera: boolean) => {
     const result = fromCamera
       ? await ImagePicker.launchCameraAsync({
           mediaTypes: ['images'],
-          quality: 0.9,
+          quality: 0.92,
           allowsEditing: true,
           aspect: [3, 4],
         })
       : await ImagePicker.launchImageLibraryAsync({
           mediaTypes: ['images'],
-          quality: 0.9,
+          quality: 0.92,
           allowsEditing: true,
           aspect: [3, 4],
         });
 
     if (result.canceled) return;
+
     const uri = result.assets[0].uri;
     setOriginalUri(uri);
-    await runAiPipeline(uri);
+    setProcessedUri(null);
+    setClassification(null);
+    setPipelineError(null);
+    setForm(DEFAULT_FORM_DATA);
+    runPipeline(uri);
   }, []);
 
-  const runAiPipeline = useCallback(async (uri: string) => {
+  // ── AI Pipeline ──────────────────────────────────────────────────────────────
+  const runPipeline = useCallback(async (uri: string) => {
     try {
-      // 1. Compress for upload (max 1200px, 80% quality)
-      const compressed = await ImageManipulator.manipulateAsync(
-        uri,
-        [{ resize: { width: 1200 } }],
-        { compress: 0.8, format: ImageManipulator.SaveFormat.JPEG },
-      );
+      // Step 1: background removal
+      setStage('compressing');
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 
-      const base64 = await FileSystem.readAsStringAsync(compressed.uri, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
+      setStage('removing-bg');
+      let processedLocalUri: string | null = null;
 
-      // 2. Remove background (server-side via Edge Function)
-      setStep('removing-bg');
-      const { data: processData, error: processError } = await supabase.functions.invoke<{
-        processedBase64: string;
-        mimeType: string;
-      }>('process-image', {
-        body: { imageBase64: base64, mimeType: 'image/jpeg' },
-      });
-
-      if (processError || !processData) throw new Error('Background removal failed');
-
-      // Save processed image locally for preview
-      const processedPath = `${FileSystem.cacheDirectory}processed-${Date.now()}.png`;
-      await FileSystem.writeAsStringAsync(processedPath, processData.processedBase64, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
-      setProcessedUri(processedPath);
-
-      // 3. Classify with Google Vision
-      setStep('classifying');
-      const { data: classData, error: classError } = await supabase.functions.invoke<{
-        type: GarmentType;
-        subtype: string | null;
-        primary_color: string;
-        secondary_color: string | null;
-        color_label: string;
-        pattern: string;
-        occasions: string[];
-        season: string[];
-        ai_confidence: number;
-        vision_raw: Record<string, unknown>;
-      }>('classify-garment', {
-        body: { imageBase64: base64, mimeType: 'image/jpeg' },
-      });
-
-      if (!classError && classData) {
-        setType(classData.type);
-        setColorLabel(classData.color_label);
-        setPrimaryColor(classData.primary_color);
-        setAiData(classData as unknown as Record<string, unknown>);
+      try {
+        processedLocalUri = await uploadToRemoveBg(uri);
+        setProcessedUri(processedLocalUri);
+        setShowingProcessed(true);
+      } catch (err) {
+        // Non-fatal: user can proceed without bg removal
+        const msg = err instanceof GarmentServiceError ? err.message : 'Error al recortar fondo';
+        Toast.show({ type: 'info', text1: 'Recorte no disponible', text2: msg });
       }
 
-      setAiDone(true);
-      setStep('idle');
+      // Step 2: classify (use processed if available, otherwise original)
+      setStage('classifying');
+      const imageToClassify = processedLocalUri ?? uri;
+
+      try {
+        const result = await classifyWithVision(imageToClassify);
+        setClassification(result);
+
+        // Pre-fill form with AI results
+        setForm((prev) => ({
+          ...prev,
+          type: result.type,
+          color_label: result.color_label,
+          primary_color: result.primary_color,
+          secondary_color: result.secondary_color ?? '',
+          pattern: result.pattern,
+          occasions: result.occasions,
+          season: result.season,
+        }));
+      } catch (err) {
+        // Non-fatal: user fills form manually
+        const msg = err instanceof GarmentServiceError ? err.message : 'Error al clasificar';
+        Toast.show({ type: 'info', text1: 'Clasificación manual', text2: msg });
+        // Provide fallback classification so saveGarment can still work
+        setClassification({
+          type: 'top',
+          subtype: null,
+          primary_color: '#888888',
+          secondary_color: null,
+          color_label: 'color',
+          pattern: 'solid',
+          occasions: ['casual'],
+          season: ['all'],
+          ai_confidence: 0,
+          vision_raw: {},
+        });
+      }
+
+      setStage('done');
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } catch (err) {
-      setStep('idle');
-      setAiDone(true); // Let user fill manually
-      Toast.show({
-        type: 'info',
-        text1: 'Clasificación automática falló',
-        text2: 'Puedes completar los datos manualmente',
+      setStage('error');
+      const msg = err instanceof Error ? err.message : 'Error desconocido';
+      setPipelineError(msg);
+      // Still allow manual entry
+      setClassification({
+        type: 'top',
+        subtype: null,
+        primary_color: '#888888',
+        secondary_color: null,
+        color_label: 'color',
+        pattern: 'solid',
+        occasions: ['casual'],
+        season: ['all'],
+        ai_confidence: 0,
+        vision_raw: {},
       });
+      setStage('done'); // advance to form so user can fill manually
     }
   }, []);
 
-  const handleSave = useCallback(async () => {
-    if (!originalUri || !user) return;
+  // ── Form helpers ─────────────────────────────────────────────────────────────
+  const setField = useCallback(<K extends keyof GarmentFormData>(
+    key: K,
+    value: GarmentFormData[K],
+  ) => {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }, []);
 
-    setStep('saving');
-    try {
-      const garmentId = crypto.randomUUID();
-
-      // Upload original
-      const originalUrl = await uploadGarmentImage(
-        user.id, garmentId, originalUri, 'original',
-      );
-
-      // Upload processed (if available)
-      let processedUrl: string | null = null;
-      if (processedUri) {
-        processedUrl = await uploadGarmentImage(
-          user.id, garmentId, processedUri, 'processed',
-        );
-      }
-
-      // Persist to DB
-      const garmentData = {
-        id: garmentId,
-        user_id: user.id,
-        original_url: originalUrl,
-        processed_url: processedUrl,
-        thumbnail_url: processedUrl ?? originalUrl,
-        type,
-        subtype: (aiData as any)?.subtype ?? null,
-        primary_color: primaryColor,
-        secondary_color: (aiData as any)?.secondary_color ?? null,
-        color_label: colorLabel || 'color',
-        pattern: (aiData as any)?.pattern ?? 'solid',
-        season: (aiData as any)?.season ?? ['all'],
-        occasions: (aiData as any)?.occasions ?? ['casual'],
-        brand: brand || null,
-        name: name || null,
-        tags: [],
-        is_favorite: false,
-        times_worn: 0,
-        last_worn: null,
-        purchase_price: null,
-        purchase_date: null,
-        notes: null,
-        is_active: true,
-        vision_raw: (aiData as any)?.vision_raw ?? null,
-        ai_confidence: (aiData as any)?.ai_confidence ?? null,
+  const toggleArrayItem = useCallback(<T extends string>(
+    key: keyof GarmentFormData,
+    item: T,
+  ) => {
+    setForm((prev) => {
+      const arr = prev[key] as T[];
+      return {
+        ...prev,
+        [key]: arr.includes(item)
+          ? arr.filter((v) => v !== item)
+          : [...arr, item],
       };
+    });
+  }, []);
 
-      const { data, error } = await supabase
-        .from('garments')
-        .insert(garmentData)
-        .select()
-        .single();
+  const addTag = useCallback(() => {
+    const tag = tagInput.trim().toLowerCase();
+    if (!tag || form.tags.includes(tag)) return;
+    setField('tags', [...form.tags, tag]);
+    setTagInput('');
+  }, [tagInput, form.tags, setField]);
 
-      if (error) throw new Error(error.message);
+  const removeTag = useCallback((tag: string) => {
+    setField('tags', form.tags.filter((t) => t !== tag));
+  }, [form.tags, setField]);
 
-      addGarment(data as Garment);
-      Toast.show({ type: 'success', text1: 'Prenda agregada al clóset' });
+  // ── Save ─────────────────────────────────────────────────────────────────────
+  const handleSave = useCallback(async () => {
+    if (!originalUri || !classification || !user) return;
+
+    if (!form.color_label.trim()) {
+      Toast.show({ type: 'error', text1: 'Agrega el color de la prenda' });
+      return;
+    }
+
+    try {
+      await addGarment({
+        originalUri,
+        processedUri,
+        classification,
+        overrides: form,
+      });
+      Toast.show({ type: 'success', text1: '¡Prenda agregada!', text2: 'Ya está en tu clóset' });
       router.back();
     } catch (err) {
-      Toast.show({ type: 'error', text1: 'Error al guardar la prenda' });
-    } finally {
-      setStep('idle');
+      const msg = err instanceof GarmentServiceError
+        ? err.message
+        : 'Error al guardar la prenda';
+      Toast.show({ type: 'error', text1: 'No se pudo guardar', text2: msg });
     }
-  }, [originalUri, processedUri, user, type, colorLabel, primaryColor, brand, name, aiData, addGarment]);
+  }, [originalUri, processedUri, classification, form, user, addGarment]);
 
-  const isProcessing = step !== 'idle';
+  const canSave = stage === 'done' && !!classification && !isSaving;
+  const isPipelineRunning = !['idle', 'done', 'error'].includes(stage);
+
+  // ─── RENDER ───────────────────────────────────────────────────────────────────
 
   return (
     <SafeAreaView style={styles.container} edges={['top', 'bottom']}>
-      {/* Header */}
-      <View style={styles.header}>
-        <Pressable onPress={() => router.back()} disabled={isProcessing}>
-          <Ionicons name="close" size={28} color={COLORS.text} />
-        </Pressable>
-        <Text style={styles.title}>Nueva prenda</Text>
-        <Pressable
-          onPress={handleSave}
-          disabled={!aiDone || isProcessing || !originalUri}
-          style={[styles.saveBtn, (!aiDone || isProcessing || !originalUri) && styles.saveBtnDisabled]}
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        keyboardVerticalOffset={0}
+      >
+        {/* ── Header ─────────────────────────────────────────────────────────── */}
+        <View style={styles.header}>
+          <Pressable
+            onPress={() => {
+              if (isPipelineRunning) {
+                Alert.alert(
+                  'Procesando...',
+                  '¿Salir ahora? El proceso se cancelará.',
+                  [
+                    { text: 'Continuar', style: 'cancel' },
+                    { text: 'Salir', onPress: () => router.back() },
+                  ],
+                );
+                return;
+              }
+              router.back();
+            }}
+          >
+            <Ionicons name="close" size={26} color={COLORS.text} />
+          </Pressable>
+
+          <Text style={styles.headerTitle}>Nueva prenda</Text>
+
+          <Pressable
+            style={[styles.saveBtn, !canSave && styles.saveBtnDisabled]}
+            onPress={handleSave}
+            disabled={!canSave}
+          >
+            {isSaving
+              ? <Ionicons name="hourglass-outline" size={16} color="#fff" />
+              : <Text style={styles.saveBtnText}>Guardar</Text>
+            }
+          </Pressable>
+        </View>
+
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
+          contentContainerStyle={styles.scroll}
         >
-          <Text style={styles.saveBtnText}>Guardar</Text>
-        </Pressable>
-      </View>
-
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scroll}>
-        {/* Image area */}
-        {!originalUri ? (
-          <View style={styles.imagePicker}>
-            <Pressable style={styles.imageOption} onPress={() => pickImage(true)}>
-              <Ionicons name="camera-outline" size={36} color={COLORS.primary} />
-              <Text style={styles.imageOptionText}>Tomar foto</Text>
-            </Pressable>
-            <View style={styles.divider} />
-            <Pressable style={styles.imageOption} onPress={() => pickImage(false)}>
-              <Ionicons name="image-outline" size={36} color={COLORS.primary} />
-              <Text style={styles.imageOptionText}>Galería</Text>
-            </Pressable>
-          </View>
-        ) : (
-          <View style={styles.imagePreview}>
-            <Image
-              source={{ uri: processedUri ?? originalUri }}
-              style={styles.previewImage}
-              contentFit="contain"
-            />
-            {isProcessing && (
-              <View style={styles.processingOverlay}>
-                <ActivityIndicator color="#fff" size="large" />
-                <Text style={styles.processingText}>{STEP_LABELS[step]}</Text>
-              </View>
-            )}
-          </View>
-        )}
-
-        {/* Classification form (shown after AI completes) */}
-        {aiDone && (
-          <View style={styles.form}>
-            <Text style={styles.sectionLabel}>Tipo de prenda</Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.typeScroll}>
-              {(Object.keys(GARMENT_TYPE_LABELS) as GarmentType[]).map((t) => (
-                <Pressable
-                  key={t}
-                  style={[styles.typeChip, type === t && styles.typeChipActive]}
-                  onPress={() => setType(t)}
-                >
-                  <Text style={[styles.typeChipText, type === t && styles.typeChipTextActive]}>
-                    {GARMENT_TYPE_LABELS[t]}
-                  </Text>
+          {/* ── Step 0: Source picker ────────────────────────────────────────── */}
+          {!originalUri && (
+            <View style={styles.sourcePicker}>
+              <Text style={styles.sourceTitle}>Agregar prenda</Text>
+              <Text style={styles.sourceSubtitle}>
+                La IA eliminará el fondo y clasificará automáticamente
+              </Text>
+              <View style={styles.sourceButtons}>
+                <Pressable style={styles.sourceBtn} onPress={() => pickImage(true)}>
+                  <View style={styles.sourceBtnIcon}>
+                    <Ionicons name="camera" size={32} color={COLORS.primary} />
+                  </View>
+                  <Text style={styles.sourceBtnLabel}>Cámara</Text>
+                  <Text style={styles.sourceBtnSub}>Tomar foto ahora</Text>
                 </Pressable>
-              ))}
-            </ScrollView>
 
-            <View style={styles.row}>
-              <View style={[styles.colorDot, { backgroundColor: primaryColor }]} />
-              <TextInput
-                style={[styles.input, styles.inputFlex]}
-                placeholder="Color (ej: azul marino)"
-                placeholderTextColor={COLORS.textMuted}
-                value={colorLabel}
-                onChangeText={setColorLabel}
-              />
+                <Pressable style={styles.sourceBtn} onPress={() => pickImage(false)}>
+                  <View style={styles.sourceBtnIcon}>
+                    <Ionicons name="images" size={32} color={COLORS.accent} />
+                  </View>
+                  <Text style={styles.sourceBtnLabel}>Galería</Text>
+                  <Text style={styles.sourceBtnSub}>Elegir de fotos</Text>
+                </Pressable>
+              </View>
             </View>
+          )}
 
-            <TextInput
-              style={styles.input}
-              placeholder="Marca (opcional)"
-              placeholderTextColor={COLORS.textMuted}
-              value={brand}
-              onChangeText={setBrand}
-            />
+          {/* ── Step 1: Image preview + pipeline ────────────────────────────── */}
+          {originalUri && (
+            <>
+              {/* Before / After comparison */}
+              <View style={styles.previewSection}>
+                <View style={styles.previewToggle}>
+                  {processedUri && (
+                    <>
+                      <Pressable
+                        style={[styles.toggleBtn, !showingProcessed && styles.toggleBtnActive]}
+                        onPress={() => setShowingProcessed(false)}
+                      >
+                        <Text style={[styles.toggleText, !showingProcessed && styles.toggleTextActive]}>
+                          Antes
+                        </Text>
+                      </Pressable>
+                      <Pressable
+                        style={[styles.toggleBtn, showingProcessed && styles.toggleBtnActive]}
+                        onPress={() => setShowingProcessed(true)}
+                      >
+                        <Text style={[styles.toggleText, showingProcessed && styles.toggleTextActive]}>
+                          Después
+                        </Text>
+                      </Pressable>
+                    </>
+                  )}
+                  <Pressable
+                    style={styles.retakeBtn}
+                    onPress={() => {
+                      setOriginalUri(null);
+                      setProcessedUri(null);
+                      setStage('idle');
+                      setClassification(null);
+                    }}
+                    disabled={isPipelineRunning}
+                  >
+                    <Ionicons name="refresh-outline" size={14} color={COLORS.textMuted} />
+                    <Text style={styles.retakeText}>Cambiar foto</Text>
+                  </Pressable>
+                </View>
 
-            <TextInput
-              style={styles.input}
-              placeholder="Nombre personalizado (opcional)"
-              placeholderTextColor={COLORS.textMuted}
-              value={name}
-              onChangeText={setName}
-            />
-          </View>
-        )}
-      </ScrollView>
+                <View style={styles.imageWrapper}>
+                  <Image
+                    source={{
+                      uri: (showingProcessed && processedUri) ? processedUri : originalUri,
+                    }}
+                    style={styles.previewImage}
+                    contentFit="contain"
+                    transition={300}
+                  />
+
+                  {/* Checkerboard pattern hint when showing processed (transparent bg) */}
+                  {showingProcessed && processedUri && (
+                    <View style={styles.checkerHint} pointerEvents="none">
+                      <Text style={styles.checkerText}>✓ Fondo eliminado</Text>
+                    </View>
+                  )}
+                </View>
+              </View>
+
+              {/* Pipeline progress */}
+              {!['idle'].includes(stage) && (
+                <View style={styles.pipelineSection}>
+                  {/* Progress bar */}
+                  <View style={styles.progressTrack}>
+                    <Animated.View
+                      style={[
+                        styles.progressFill,
+                        {
+                          width: progressAnim.interpolate({
+                            inputRange: [0, 100],
+                            outputRange: ['0%', '100%'],
+                          }),
+                        },
+                      ]}
+                    />
+                  </View>
+
+                  {/* Step dots */}
+                  <View style={styles.stepsRow}>
+                    {PIPELINE_STEPS.map((step, i) => {
+                      const stepIdx = stageIndex(step.stage);
+                      const currentIdx = stageIndex(stage);
+                      const isDone = currentIdx > stepIdx || stage === 'done';
+                      const isActive = currentIdx === stepIdx;
+
+                      return (
+                        <View key={step.stage} style={styles.stepItem}>
+                          <View style={[
+                            styles.stepDot,
+                            isDone && styles.stepDotDone,
+                            isActive && styles.stepDotActive,
+                          ]}>
+                            {isDone
+                              ? <Ionicons name="checkmark" size={10} color="#fff" />
+                              : isActive
+                                ? <View style={styles.stepPulse} />
+                                : <View style={styles.stepDotInner} />
+                            }
+                          </View>
+                          <Text style={[
+                            styles.stepLabel,
+                            (isDone || isActive) && styles.stepLabelActive,
+                          ]}>
+                            {step.label}
+                          </Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+
+                  {/* Status message */}
+                  <Text style={styles.stageMessage}>
+                    {UPLOAD_STAGE_MESSAGES[stage]}
+                  </Text>
+                </View>
+              )}
+            </>
+          )}
+
+          {/* ── Step 2: Form (shown when pipeline done) ───────────────────── */}
+          {stage === 'done' && classification && (
+            <View style={styles.form}>
+              {/* AI confidence badge */}
+              {classification.ai_confidence > 0 && (
+                <View style={styles.aiBadge}>
+                  <Ionicons name="sparkles" size={13} color={COLORS.primary} />
+                  <Text style={styles.aiBadgeText}>
+                    Clasificado con IA · {Math.round(classification.ai_confidence * 100)}% confianza
+                  </Text>
+                  <Text style={styles.aiBadgeHint}>Revisa y ajusta si es necesario</Text>
+                </View>
+              )}
+
+              {/* ── Tipo ──────────────────────────────────────────────────── */}
+              <Section label="Tipo de prenda *">
+                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                  <View style={styles.chipRow}>
+                    {(Object.keys(GARMENT_TYPE_LABELS) as GarmentType[]).map((t) => (
+                      <Chip
+                        key={t}
+                        label={GARMENT_TYPE_LABELS[t]}
+                        active={form.type === t}
+                        onPress={() => setField('type', t)}
+                      />
+                    ))}
+                  </View>
+                </ScrollView>
+              </Section>
+
+              {/* ── Nombre & Marca ─────────────────────────────────────────── */}
+              <Section label="Información básica">
+                <Field
+                  placeholder="Nombre personalizado (ej: blazer favorito)"
+                  value={form.name}
+                  onChangeText={(v) => setField('name', v)}
+                  maxLength={50}
+                />
+                <Field
+                  placeholder="Marca (opcional)"
+                  value={form.brand}
+                  onChangeText={(v) => setField('brand', v)}
+                  maxLength={40}
+                />
+              </Section>
+
+              {/* ── Color ─────────────────────────────────────────────────── */}
+              <Section label="Color *">
+                <View style={styles.colorRow}>
+                  <View style={[styles.colorDot, { backgroundColor: form.primary_color }]} />
+                  <Field
+                    placeholder="Nombre del color (ej: azul marino)"
+                    value={form.color_label}
+                    onChangeText={(v) => setField('color_label', v)}
+                    style={{ flex: 1 }}
+                    maxLength={30}
+                  />
+                </View>
+                {form.secondary_color !== '' && (
+                  <View style={styles.colorRow}>
+                    <View style={[styles.colorDot, { backgroundColor: form.secondary_color }]} />
+                    <Text style={styles.secondaryColorText}>Color secundario detectado</Text>
+                  </View>
+                )}
+              </Section>
+
+              {/* ── Patrón ────────────────────────────────────────────────── */}
+              <Section label="Patrón">
+                <View style={styles.chipRow}>
+                  {PATTERN_OPTIONS.map((p) => (
+                    <Chip
+                      key={p}
+                      label={PATTERN_LABELS[p]}
+                      active={form.pattern === p}
+                      onPress={() => setField('pattern', p)}
+                    />
+                  ))}
+                </View>
+              </Section>
+
+              {/* ── Ocasiones ─────────────────────────────────────────────── */}
+              <Section label="Ocasiones (selecciona todas las que apliquen)">
+                <View style={styles.chipRow}>
+                  {OCCASION_OPTIONS.map((o) => (
+                    <Chip
+                      key={o}
+                      label={OCCASION_LABELS[o]}
+                      active={form.occasions.includes(o)}
+                      onPress={() => toggleArrayItem('occasions', o)}
+                    />
+                  ))}
+                </View>
+              </Section>
+
+              {/* ── Temporada ─────────────────────────────────────────────── */}
+              <Section label="Temporada">
+                <View style={styles.chipRow}>
+                  {SEASON_OPTIONS.map((s) => (
+                    <Chip
+                      key={s}
+                      label={SEASON_LABELS[s]}
+                      active={form.season.includes(s)}
+                      onPress={() => toggleArrayItem('season', s)}
+                    />
+                  ))}
+                </View>
+              </Section>
+
+              {/* ── Tags ──────────────────────────────────────────────────── */}
+              <Section label="Etiquetas">
+                <View style={styles.tagInputRow}>
+                  <TextInput
+                    style={[styles.input, { flex: 1 }]}
+                    placeholder="Agregar etiqueta..."
+                    placeholderTextColor={COLORS.textMuted}
+                    value={tagInput}
+                    onChangeText={setTagInput}
+                    onSubmitEditing={addTag}
+                    blurOnSubmit={false}
+                    returnKeyType="done"
+                    maxLength={20}
+                    autoCapitalize="none"
+                  />
+                  <Pressable
+                    style={[styles.tagAddBtn, !tagInput.trim() && styles.tagAddBtnDisabled]}
+                    onPress={addTag}
+                    disabled={!tagInput.trim()}
+                  >
+                    <Ionicons name="add" size={20} color="#fff" />
+                  </Pressable>
+                </View>
+                {form.tags.length > 0 && (
+                  <View style={styles.tagsList}>
+                    {form.tags.map((tag) => (
+                      <Pressable
+                        key={tag}
+                        style={styles.tagPill}
+                        onPress={() => removeTag(tag)}
+                      >
+                        <Text style={styles.tagText}>#{tag}</Text>
+                        <Ionicons name="close" size={12} color={COLORS.primary} />
+                      </Pressable>
+                    ))}
+                  </View>
+                )}
+              </Section>
+
+              {/* ── Notas ─────────────────────────────────────────────────── */}
+              <Section label="Notas personales">
+                <TextInput
+                  style={[styles.input, styles.notesInput]}
+                  placeholder="Instrucciones de lavado, talla, recuerdos... (opcional)"
+                  placeholderTextColor={COLORS.textMuted}
+                  value={form.notes}
+                  onChangeText={(v) => setField('notes', v)}
+                  multiline
+                  numberOfLines={3}
+                  textAlignVertical="top"
+                  maxLength={300}
+                />
+              </Section>
+
+              {/* ── Precio & Fecha de compra (collapsible) ────────────────── */}
+              <Section label="Detalles de compra (opcional)">
+                <View style={styles.twoCol}>
+                  <Field
+                    placeholder="Precio"
+                    value={form.purchase_price}
+                    onChangeText={(v) => setField('purchase_price', v)}
+                    keyboardType="decimal-pad"
+                    style={{ flex: 1 }}
+                  />
+                  <Field
+                    placeholder="Fecha (YYYY-MM-DD)"
+                    value={form.purchase_date}
+                    onChangeText={(v) => setField('purchase_date', v)}
+                    style={{ flex: 1.4 }}
+                    maxLength={10}
+                  />
+                </View>
+              </Section>
+
+              {/* ── Save CTA (duplicate at bottom for thumb reach) ────────── */}
+              <Pressable
+                style={[styles.saveCta, !canSave && styles.saveCtaDisabled]}
+                onPress={handleSave}
+                disabled={!canSave}
+              >
+                <Ionicons name="checkmark-circle" size={20} color="#fff" />
+                <Text style={styles.saveCtaText}>
+                  {isSaving ? 'Guardando...' : 'Agregar al clóset'}
+                </Text>
+              </Pressable>
+            </View>
+          )}
+        </ScrollView>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
+// ─── Micro-components ─────────────────────────────────────────────────────────
+
+function Section({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <View style={sectionStyles.container}>
+      <Text style={sectionStyles.label}>{label}</Text>
+      {children}
+    </View>
+  );
+}
+
+function Chip({
+  label, active, onPress,
+}: { label: string; active: boolean; onPress: () => void }) {
+  return (
+    <Pressable
+      style={[chipStyles.chip, active && chipStyles.active]}
+      onPress={onPress}
+    >
+      <Text style={[chipStyles.text, active && chipStyles.textActive]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function Field({
+  placeholder, value, onChangeText, style, maxLength, keyboardType,
+}: {
+  placeholder: string;
+  value: string;
+  onChangeText: (v: string) => void;
+  style?: object;
+  maxLength?: number;
+  keyboardType?: 'default' | 'decimal-pad' | 'email-address';
+}) {
+  return (
+    <TextInput
+      style={[fieldStyles.input, style]}
+      placeholder={placeholder}
+      placeholderTextColor={COLORS.textMuted}
+      value={value}
+      onChangeText={onChangeText}
+      maxLength={maxLength}
+      keyboardType={keyboardType ?? 'default'}
+      autoCapitalize="sentences"
+    />
+  );
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
+const sectionStyles = StyleSheet.create({
+  container: { marginBottom: SPACING.md },
+  label: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.textMuted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+    marginBottom: SPACING.sm,
+  },
+});
+
+const chipStyles = StyleSheet.create({
+  chip: {
+    paddingHorizontal: 13,
+    paddingVertical: 8,
+    borderRadius: RADIUS.full,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.surface,
+    marginRight: SPACING.xs,
+    marginBottom: SPACING.xs,
+  },
+  active: { backgroundColor: COLORS.primary, borderColor: COLORS.primary },
+  text: { fontSize: 13, color: COLORS.textMuted },
+  textActive: { color: '#fff', fontWeight: '600' },
+});
+
+const fieldStyles = StyleSheet.create({
+  input: {
+    backgroundColor: COLORS.surface,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: RADIUS.sm,
+    paddingHorizontal: SPACING.sm,
+    paddingVertical: 11,
+    fontSize: 14,
+    color: COLORS.text,
+    marginBottom: SPACING.xs,
+  },
+});
+
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
+
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -311,64 +773,225 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
   },
-  title: { fontSize: 17, fontWeight: '600', color: COLORS.text },
+  headerTitle: { fontSize: 17, fontWeight: '600', color: COLORS.text },
   saveBtn: {
     backgroundColor: COLORS.primary,
     paddingHorizontal: SPACING.md,
     paddingVertical: 8,
-    borderRadius: 20,
-  },
-  saveBtnDisabled: { opacity: 0.4 },
-  saveBtnText: { color: '#fff', fontWeight: '600' },
-  scroll: { paddingBottom: 40 },
-  imagePicker: {
-    flexDirection: 'row',
-    height: 240,
-    margin: SPACING.md,
-    borderRadius: 16,
-    borderWidth: 2,
-    borderColor: COLORS.border,
-    borderStyle: 'dashed',
-    overflow: 'hidden',
-  },
-  imageOption: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 8 },
-  imageOptionText: { fontSize: 14, color: COLORS.textMuted },
-  divider: { width: 1, backgroundColor: COLORS.border },
-  imagePreview: { height: 360, margin: SPACING.md, borderRadius: 16, overflow: 'hidden' },
-  previewImage: { width: '100%', height: '100%' },
-  processingOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.65)',
-    justifyContent: 'center',
+    borderRadius: RADIUS.full,
+    minWidth: 80,
     alignItems: 'center',
-    gap: 12,
   },
-  processingText: { color: '#fff', fontSize: 15, fontWeight: '500' },
-  form: { paddingHorizontal: SPACING.md, gap: SPACING.sm },
-  sectionLabel: { fontSize: 13, fontWeight: '600', color: COLORS.textMuted, textTransform: 'uppercase', letterSpacing: 0.5 },
-  typeScroll: { marginHorizontal: -SPACING.md, paddingHorizontal: SPACING.md },
-  typeChip: {
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-    borderRadius: 20,
+  saveBtnDisabled: { opacity: 0.35 },
+  saveBtnText: { color: '#fff', fontWeight: '600', fontSize: 14 },
+
+  scroll: { paddingBottom: 48 },
+
+  // Source picker
+  sourcePicker: {
+    paddingHorizontal: SPACING.md,
+    paddingTop: SPACING.xl,
+    alignItems: 'center',
+  },
+  sourceTitle: { fontSize: 22, fontWeight: '700', color: COLORS.text, marginBottom: 6 },
+  sourceSubtitle: {
+    fontSize: 14,
+    color: COLORS.textMuted,
+    textAlign: 'center',
+    marginBottom: SPACING.xl,
+    lineHeight: 20,
+  },
+  sourceButtons: { flexDirection: 'row', gap: SPACING.md, width: '100%' },
+  sourceBtn: {
+    flex: 1,
+    backgroundColor: COLORS.surface,
+    borderRadius: RADIUS.lg,
     borderWidth: 1,
     borderColor: COLORS.border,
-    marginRight: 8,
+    padding: SPACING.md,
+    alignItems: 'center',
+    gap: SPACING.xs,
   },
-  typeChipActive: { backgroundColor: COLORS.primary, borderColor: COLORS.primary },
-  typeChipText: { fontSize: 13, color: COLORS.textMuted },
-  typeChipTextActive: { color: '#fff', fontWeight: '600' },
-  row: { flexDirection: 'row', alignItems: 'center', gap: SPACING.sm },
-  colorDot: { width: 36, height: 36, borderRadius: 18, borderWidth: 2, borderColor: COLORS.border },
+  sourceBtnIcon: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: COLORS.surfaceAlt,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: SPACING.xs,
+  },
+  sourceBtnLabel: { fontSize: 15, fontWeight: '600', color: COLORS.text },
+  sourceBtnSub: { fontSize: 12, color: COLORS.textMuted },
+
+  // Image preview
+  previewSection: { marginHorizontal: SPACING.md, marginTop: SPACING.sm },
+  previewToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: SPACING.xs,
+    marginBottom: SPACING.xs,
+  },
+  toggleBtn: {
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: RADIUS.full,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  toggleBtnActive: {
+    backgroundColor: COLORS.primary,
+    borderColor: COLORS.primary,
+  },
+  toggleText: { fontSize: 13, color: COLORS.textMuted },
+  toggleTextActive: { color: '#fff', fontWeight: '600' },
+  retakeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginLeft: 'auto',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  retakeText: { fontSize: 12, color: COLORS.textMuted },
+  imageWrapper: {
+    height: 300,
+    borderRadius: RADIUS.lg,
+    overflow: 'hidden',
+    backgroundColor: COLORS.surfaceAlt,
+    position: 'relative',
+  },
+  previewImage: { width: '100%', height: '100%' },
+  checkerHint: {
+    position: 'absolute',
+    bottom: 8,
+    left: 8,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderRadius: RADIUS.full,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  checkerText: { fontSize: 11, color: COLORS.success, fontWeight: '600' },
+
+  // Pipeline progress
+  pipelineSection: {
+    marginHorizontal: SPACING.md,
+    marginTop: SPACING.md,
+    backgroundColor: COLORS.surface,
+    borderRadius: RADIUS.md,
+    padding: SPACING.md,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  progressTrack: {
+    height: 3,
+    backgroundColor: COLORS.border,
+    borderRadius: 2,
+    overflow: 'hidden',
+    marginBottom: SPACING.md,
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: COLORS.primary,
+    borderRadius: 2,
+  },
+  stepsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: SPACING.sm,
+  },
+  stepItem: { alignItems: 'center', gap: 4 },
+  stepDot: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: COLORS.border,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  stepDotDone: { backgroundColor: COLORS.success },
+  stepDotActive: { backgroundColor: COLORS.primary },
+  stepDotInner: { width: 8, height: 8, borderRadius: 4, backgroundColor: COLORS.textMuted },
+  stepPulse: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#fff' },
+  stepLabel: { fontSize: 10, color: COLORS.textMuted },
+  stepLabelActive: { color: COLORS.text, fontWeight: '600' },
+  stageMessage: { fontSize: 13, color: COLORS.textMuted, textAlign: 'center' },
+
+  // Form
+  form: { paddingHorizontal: SPACING.md, paddingTop: SPACING.md },
+  aiBadge: {
+    backgroundColor: COLORS.primary + '18',
+    borderRadius: RADIUS.sm,
+    padding: SPACING.sm,
+    marginBottom: SPACING.md,
+    borderWidth: 1,
+    borderColor: COLORS.primary + '33',
+    gap: 3,
+  },
+  aiBadgeText: { fontSize: 13, color: COLORS.primary, fontWeight: '600' },
+  aiBadgeHint: { fontSize: 12, color: COLORS.textMuted },
+
+  chipRow: { flexDirection: 'row', flexWrap: 'wrap' },
+
+  colorRow: { flexDirection: 'row', alignItems: 'center', gap: SPACING.sm, marginBottom: SPACING.xs },
+  colorDot: { width: 36, height: 36, borderRadius: 18, borderWidth: 2, borderColor: COLORS.border, flexShrink: 0 },
+  secondaryColorText: { fontSize: 13, color: COLORS.textMuted },
+
+  twoCol: { flexDirection: 'row', gap: SPACING.sm },
+
+  tagInputRow: { flexDirection: 'row', gap: SPACING.xs, alignItems: 'center', marginBottom: SPACING.xs },
+  tagAddBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: RADIUS.sm,
+    backgroundColor: COLORS.primary,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  tagAddBtnDisabled: { opacity: 0.4 },
+  tagsList: { flexDirection: 'row', flexWrap: 'wrap', gap: SPACING.xs },
+  tagPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: COLORS.primary + '22',
+    borderRadius: RADIUS.full,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderWidth: 1,
+    borderColor: COLORS.primary + '44',
+  },
+  tagText: { fontSize: 12, color: COLORS.primary },
+
   input: {
     backgroundColor: COLORS.surface,
     borderWidth: 1,
     borderColor: COLORS.border,
-    borderRadius: 12,
-    paddingHorizontal: SPACING.md,
-    paddingVertical: 12,
-    fontSize: 15,
+    borderRadius: RADIUS.sm,
+    paddingHorizontal: SPACING.sm,
+    paddingVertical: 11,
+    fontSize: 14,
     color: COLORS.text,
+    marginBottom: SPACING.xs,
   },
-  inputFlex: { flex: 1 },
+  notesInput: { height: 80, textAlignVertical: 'top' },
+
+  saveCta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: SPACING.sm,
+    backgroundColor: COLORS.primary,
+    borderRadius: RADIUS.md,
+    paddingVertical: 16,
+    marginTop: SPACING.sm,
+    marginBottom: SPACING.xl,
+    shadowColor: COLORS.primary,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.35,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  saveCtaDisabled: { opacity: 0.4 },
+  saveCtaText: { fontSize: 16, fontWeight: '700', color: '#fff' },
 });
