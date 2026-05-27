@@ -70,6 +70,23 @@ web_modules/
 .env.*
 !.env.example
 
+# Expo
+.expo/
+web-build/
+
+# Sensitive credentials
+*.pem
+play-store-key.json
+google-services.json
+GoogleService-Info.plist
+
+# Supabase local
+supabase/.branches
+supabase/.temp
+
+# macOS
+.DS_Store
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
